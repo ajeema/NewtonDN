@@ -9,12 +9,15 @@ from natsort import natsorted
 from glob import glob
 import cv2
 import argparse
+
+from utils.colors import linear2srgb, srgb2linear
 from model.NewtonDN import NewtonDN_model
 import math
 from tqdm import tqdm
 import time
 import warnings
 
+# Suppress the specific UserWarning
 warnings.filterwarnings("ignore",
                         message="torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument.")
 
@@ -25,11 +28,53 @@ parser.add_argument('--window_size', default=8, type=int, help='window size')
 parser.add_argument('--size', default=256, type=int, help='model image patch size')
 parser.add_argument('--stride', default=128, type=int, help='reconstruction stride')
 parser.add_argument('--result_dir', default='./results/', type=str, help='Directory for results')
+parser.add_argument('-cf', required=False, action='store_true', help='Use color correction if enabled.')
 parser.add_argument('--weights',
                     default='./ckpt/NewtonDN.pth', type=str,
                     help='Path to weights')
 
 args = parser.parse_args()
+
+
+def color_fix(imgA, imgB):
+    """ Fix coloration changes by adding the difference in
+        the low frequency of the original image
+    """
+    kernel_size = 3
+    scaling = False
+
+    # convert images to linear space
+    imgA = srgb2linear(imgA)
+    imgB = srgb2linear(imgB)
+
+    # downscale imgB to imgA size if needed
+    hA, wA = imgA.shape[0:2]
+    hB, wB = imgB.shape[0:2]
+    if hA < hB and wA < wB:
+        scaling = True
+        imgB_ds = cv2.resize(
+            imgB, dsize=(wA, hA), interpolation=cv2.INTER_CUBIC)
+    else:
+        imgB_ds = imgB
+
+    # compute the difference (ie: LR - SR)
+    diff = imgA - imgB_ds
+
+    # gaussian blur for low frequency information (colors)
+    # TODO: test with guided filter
+    blurred = cv2.GaussianBlur(diff, (kernel_size, kernel_size), 0)
+
+    # upscale if needed and add diff back to the imgB
+    if scaling:
+        blurred = cv2.resize(
+            blurred, dsize=(wB, hB), interpolation=cv2.INTER_CUBIC)
+    rlt = blurred + imgB
+
+    # rlt = denorm(rlt, min_max=(rlt.min(), rlt.max()))
+
+    # back to srgb space and return
+    return linear2srgb(rlt)
+
 
 
 def overlapped_square(timg, kernel=256, stride=128):
@@ -70,6 +115,7 @@ def load_checkpoint(model, weights):
                 new_state_dict[name] = v
             model.load_state_dict(new_state_dict)
     else:
+        # If 'state_dict' key doesn't exist, assume the checkpoint file directly contains the state dict
         try:
             model.load_state_dict(checkpoint)
         except Exception as e:
@@ -102,6 +148,11 @@ print('restoring images......')
 
 stride = args.stride
 model_img = args.size
+
+
+def color_fix(model_img, restored):
+    pass
+
 
 for file_ in tqdm(files, desc="Processing images", ncols=100):
     start_time = time.time()
@@ -142,6 +193,13 @@ for file_ in tqdm(files, desc="Processing images", ncols=100):
     elapsed_time = time.time() - start_time
     fps = 1 / elapsed_time
     print(f" - Processed at {fps:.2f} FPS")
+    if args.cf:
+        img_out = color_fix(model_img, restored)
+
+        # save images
+        f = os.path.splitext(os.path.split(file_)[-1])[0]
+        save_img((os.path.join(out_dir, f + '.png')), restored)
+
 
     f = os.path.splitext(os.path.split(file_)[-1])[0]
     save_img((os.path.join(out_dir, f + '.png')), restored)
